@@ -1,4 +1,4 @@
-name: "⚡ EnigMano Win11 + 128 Cores Deployment"
+name: EnigMano Instance Deployment
 
 on:
   workflow_dispatch:
@@ -10,65 +10,260 @@ on:
 
 jobs:
   deploy-enigmano:
-    name: "🚀 Deploy EnigMano Instance ${{ github.event.inputs.INSTANCE }}"
-    runs-on: windows-11-arm
+    runs-on: windows-latest
 
     env:
       INSTANCE_ID: ${{ github.event.inputs.INSTANCE }}
       SECRET_SHAHZAIB: ${{ secrets.SECRET_SHAHZAIB }}
       NGROK_SHAHZAIB: ${{ secrets.NGROK_SHAHZAIB }}
-      REPO: ${{ github.repository }}
-      WORKFLOW_FILE: "enigmano-Win-11-128-Cores.yml"
-      DEPLOYMENT_ID: ${{ github.run_id }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      BOT_ZIP_URL: "https://www.dropbox.com/scl/fi/gmvwihaldwpl0kgswvxdo/bot.zip?rlkey=42hs0lk9kjh1a6g57zkwfocpz&st=i1ld0nyk&dl=1"
 
     steps:
-      - name: 📌 Deployment Parameters
+      - name: Deployment Parameters
         shell: pwsh
         run: |
           $prevInstance = [int]$env:INSTANCE_ID - 1
           Write-Host "==============================================="
-          Write-Host "🔹 EnigMano Instance     : $env:INSTANCE_ID"
-          Write-Host "🔢 Previous Instance     : $prevInstance"
-          Write-Host "📦 GitHub Repository     : $env:REPO"
-          Write-Host "🔁 Deployment Workflow   : $env:WORKFLOW_FILE"
-          Write-Host "🆔 Deployment ID         : $env:DEPLOYMENT_ID"
+          Write-Host "Instance ID          : $env:INSTANCE_ID"
+          Write-Host "Previous Instance    : $prevInstance"
+          Write-Host "Repository           : $env:GITHUB_REPOSITORY"
+          Write-Host "Workflow File        : enigmano.yml"
+          Write-Host "Deployment ID        : $env:GITHUB_RUN_ID"
           Write-Host "==============================================="
 
-      - name: 🔐 Validate Secrets
+      - name: Validate Secrets
         shell: pwsh
         run: |
-          if (-not $env:SECRET_SHAHZAIB) {
-            Write-Error "❌ Missing GitHub Secret: SECRET_SHAHZAIB"
-            exit 1
-          }
-          if (-not $env:NGROK_SHAHZAIB) {
-            Write-Error "❌ Missing Ngrok Auth Token: NGROK_SHAHZAIB"
-            exit 1
-          }
-          Write-Host "✅ All required secrets validated successfully"
+          if (-not $env:SECRET_SHAHZAIB) { Write-Error "Missing GitHub Secret: SECRET_SHAHZAIB"; exit 1 }
+          if (-not $env:NGROK_SHAHZAIB) { Write-Error "Missing Ngrok Auth Token: NGROK_SHAHZAIB"; exit 1 }
+          if (-not $env:RDP_PASSWORD)  { Write-Host  "Warning: No RDP_PASSWORD set. You should add one for reliable login." }
+          Write-Host "Secrets OK"
 
-      - name: 📥 Download EnigMano-instance.ps1
+      - name: Download EnigMano-instance.ps1
         shell: pwsh
         run: |
-          $url = "https://gitlab.com/Shahzaib-YT/enigmano-windows-11-with-sound/-/raw/main/EnigMano-Instance.ps1"
-          Write-Host "🌐 Downloading EnigMano-Instance.ps1..."
-          Invoke-WebRequest -Uri $url -OutFile "EnigMano-Instance.ps1" -UseBasicParsing
-          if (!(Test-Path "./EnigMano-Instance.ps1")) {
-            Write-Error "❌ Failed to download EnigMano-Instance.ps1"
+          $url = "https://gitlab.com/Shahzaib-YT/enigmano-multi-instance/-/raw/main/EnigMano-instance.ps1"
+          Write-Host "Downloading EnigMano-instance.ps1..."
+          Invoke-WebRequest -Uri $url -OutFile "EnigMano-instance.ps1" -UseBasicParsing
+          if (!(Test-Path "./EnigMano-instance.ps1")) {
+            Write-Error "Failed to download EnigMano-instance.ps1"
             exit 1
           }
-          Write-Host "✅ EnigMano-Instance.ps1 downloaded successfully"
+          Write-Host "EnigMano-instance.ps1 downloaded successfully"
 
-      - name: ⚔️ Execute EnigMano Instance Script
+      - name: Execute EnigMano Instance Script (background; EnigMano controls ngrok)
         shell: pwsh
         run: |
-          Write-Host "🚦 Initiating EnigMano-Instance.ps1"
-          powershell.exe -ExecutionPolicy Bypass -File ".\EnigMano-Instance.ps1"
+          Write-Host "Starting EnigMano-instance.ps1 in background..."
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "powershell.exe"
+          $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File ".\EnigMano-instance.ps1"'
+          $psi.UseShellExecute = $true
+          $psi.WindowStyle = 'Hidden'
+          [void][System.Diagnostics.Process]::Start($psi)
+          # Give EnigMano time to enable RDP and start ngrok
+          Start-Sleep -Seconds 180
 
-      - name: 💠 Final Status
+      - name: RDP harden + diagnostics
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "== Enable RDP and firewall =="
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+          Write-Host "== Read/print RDP port from registry =="
+          $rdpKey = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+          if (-not (Test-Path $rdpKey)) { New-Item -Path $rdpKey -Force | Out-Null }
+          $port = (Get-ItemProperty $rdpKey -Name "PortNumber" -ErrorAction SilentlyContinue).PortNumber
+          if (-not $port) {
+            New-ItemProperty -Path $rdpKey -Name "PortNumber" -Value 3389 -PropertyType DWord -Force | Out-Null
+            $port = 3389
+          }
+          Write-Host ("RDP Port (registry): {0}" -f $port)
+
+          Write-Host "== Disable NLA (UserAuthentication=0) to avoid client policy failures =="
+          Set-ItemProperty -Path $rdpKey -Name "UserAuthentication" -Value 0
+
+          Write-Host "== Ensure TermService running and set to Automatic =="
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          if ($env:RDP_PASSWORD) {
+            Write-Host "== Set runneradmin password from secret =="
+            net user runneradmin "$env:RDP_PASSWORD" | Out-Null
+          } else {
+            Write-Host "No RDP_PASSWORD secret provided. Add one if login fails."
+          }
+
+          Write-Host "`n== Quick checks =="
+          Write-Host "-- TermService --"
+          sc.exe query TermService
+
+          Write-Host "`n-- Firewall rule 'Remote Desktop' --"
+          netsh advfirewall firewall show rule name="Remote Desktop" verbose=enable
+
+          Write-Host ("`n-- netstat for RDP port {0} --" -f $port)
+          netstat -ano | findstr (":" + $port)
+
+          Write-Host ("`n-- Test-NetConnection 127.0.0.1:{0} --" -f $port)
+          try { Test-NetConnection -ComputerName 127.0.0.1 -Port $port -InformationLevel Detailed } catch { Write-Host $_.Exception.Message }
+
+          Write-Host "`n== If ngrok is running, show its command line =="
+          Get-CimInstance Win32_Process -Filter "Name='ngrok.exe'" | Select-Object ProcessId, CommandLine
+
+      - name: Discover ngrok URL (non-intrusive)
+        shell: pwsh
+        env:
+          GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
+          NGROK_SHAHZAIB: ${{ secrets.NGROK_SHAHZAIB }}
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $ngrokDir = "C:\Users\runneradmin\ngrok"
+          $ngrokExe = Join-Path $ngrokDir "ngrok.exe"
+          if (-not (Test-Path $ngrokExe)) {
+            New-Item -ItemType Directory -Force -Path $ngrokDir | Out-Null
+            $zip = Join-Path $ngrokDir "ngrok.zip"
+            Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" -OutFile $zip -UseBasicParsing
+            Expand-Archive -Path $zip -DestinationPath $ngrokDir -Force
+            Remove-Item $zip -Force
+          }
+          & $ngrokExe config add-authtoken $env:NGROK_SHAHZAIB | Out-Null
+
+          function Try-GetUrl-FromApi {
+            try {
+              $json = & $ngrokExe api tunnels list --json 2>$null
+              if ($LASTEXITCODE -ne 0 -or -not $json) { return $null }
+              $obj = $json | ConvertFrom-Json
+              if ($obj -and $obj.tunnels) {
+                foreach ($t in $obj.tunnels) {
+                  if ($t.public_url -and ($t.public_url -like 'tcp://*:*')) { return $t.public_url }
+                  if ($t.url -and ($t.url -like 'tcp://*:*')) { return $t.url }
+                }
+              }
+            } catch { return $null }
+            return $null
+          }
+
+          function Try-GetUrl-FromFiles {
+            $roots = @('C:\Users\runneradmin','C:\Users\runneradmin\AppData\Local\Temp')
+            foreach ($r in $roots) {
+              if (-not (Test-Path $r)) { continue }
+              $files = Get-ChildItem -Path $r -Recurse -Include *.log,*.txt,*.ps1,*.json,*.md -ErrorAction SilentlyContinue
+              foreach ($f in $files) {
+                try {
+                  $txt = Get-Content -LiteralPath $f.FullName -Raw
+                  if ($txt -match 'tcp://[0-9a-zA-Z\.-]+:\d+') { return $Matches[0] }
+                } catch {}
+              }
+            }
+            return $null
+          }
+
+          $urlFile = "C:\Users\runneradmin\ngrok\ngrok-url.txt"
+          $final = $null
+
+          # poll up to 5 minutes (ngrok may take time)
+          $timeout = (Get-Date).AddMinutes(5)
+          while ((Get-Date) -lt $timeout -and -not $final) {
+            $final = Try-GetUrl-FromApi
+            if (-not $final) { $final = Try-GetUrl-FromFiles }
+            if ($final) { break }
+            Start-Sleep -Seconds 5
+          }
+
+          if ($final) {
+            Write-Host ("[ngrok] RDP address: {0}" -f $final)
+            Set-Content -LiteralPath $urlFile -Value $final -Encoding ASCII
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ("## RDP (ngrok)\n\n- Address: `{0}`\n- Username: `runneradmin`\n- Password: your RDP_PASSWORD\n" -f $final)
+          } else {
+            Write-Host "Could not detect ngrok tcp URL yet (API/files). It may appear later in EnigMano logs."
+          }
+
+      - name: Download and extract Bot to C:\Users\runneradmin\Downloads\Bot
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $BOT_BASE = "C:\Users\runneradmin\Downloads\Bot"
+          $downloads = "C:\Users\runneradmin\Downloads"
+
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          New-Item -ItemType Directory -Force -Path $BOT_BASE | Out-Null
+
+          $tmp = Join-Path $env:TEMP ('botdl_' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+
+          try {
+            $zipPath = Join-Path $tmp 'bot.zip'
+            Write-Host ("Downloading Bot.zip from {0} ..." -f $env:BOT_ZIP_URL)
+            Invoke-WebRequest -Uri $env:BOT_ZIP_URL -OutFile $zipPath -UseBasicParsing
+
+            $extract = Join-Path $tmp 'unzipped'
+            Expand-Archive -Path $zipPath -DestinationPath $extract -Force
+
+            $candidates = @(
+              (Join-Path $extract 'Bot'),
+              (Join-Path $extract 'bot')
+            ) | Where-Object { Test-Path $_ }
+
+            if ($candidates.Count -gt 0) {
+              $root = $candidates[0]
+              Write-Host ("Found root folder in archive: {0}" -f $root)
+              Copy-Item -Path (Join-Path $root '*') -Destination $BOT_BASE -Recurse -Force
+            } else {
+              Write-Host "No root 'Bot' folder; copying all extracted files into BOT_BASE"
+              Copy-Item -Path (Join-Path $extract '*') -Destination $BOT_BASE -Recurse -Force
+            }
+
+            Write-Host "Downloads directory listing:"
+            Get-ChildItem -Force $downloads | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
+            Write-Host "Bot directory listing:"
+            Get-ChildItem -Force $BOT_BASE | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
+
+          } finally {
+            try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+          }
+
+      - name: Launch bots (start-bots.bat)
+        shell: pwsh
+        run: |
+          $BOT_BASE = "C:\Users\runneradmin\Downloads\Bot"
+          $bat = Join-Path $BOT_BASE 'start-bots.bat'
+          if (-not (Test-Path $bat)) { throw ("start-bots.bat not found at {0}" -f $bat) }
+          Write-Host "Launching bots via start-bots.bat ..."
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $bat
+          $psi.WorkingDirectory = $BOT_BASE
+          $psi.UseShellExecute = $true
+          $psi.WindowStyle = 'Normal'
+          [void][System.Diagnostics.Process]::Start($psi)
+
+      - name: Keep session open (fixed window, heartbeat)
+        shell: pwsh
+        run: |
+          $minutes = 180
+          $interval = 20
+          $loops = [Math]::Ceiling(($minutes * 60) / $interval)
+          Write-Host ("Holding session open for {0} minutes with {1}s heartbeat..." -f $minutes, $interval)
+          for ($i = 1; $i -le $loops; $i++) {
+            if (Test-Path "C:\Users\runneradmin\ngrok\ngrok-url.txt") {
+              $url = Get-Content "C:\Users\runneradmin\ngrok\ngrok-url.txt" -ErrorAction SilentlyContinue
+              if ($url) { Write-Host ("Current RDP URL: {0}" -f $url) }
+            }
+            Start-Sleep -Seconds $interval
+          }
+          Write-Host "Fixed hold complete."
+
+      - name: Final Status
         if: always()
         shell: pwsh
         run: |
-          Write-Host "✅ EnigMano Instance $env:INSTANCE_ID completed execution."
-          Write-Host "🔋 Powered by: SHAHZAIB-YT"
-          Write-Host "🏁 EnigMano deployment executed with tactical precision."
+          Write-Host ("Pipeline finished for instance {0}." -f $env:INSTANCE_ID)
